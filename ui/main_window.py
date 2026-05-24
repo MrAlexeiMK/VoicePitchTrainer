@@ -135,6 +135,13 @@ def _create_icons() -> dict[str, QIcon]:
         </svg>
     """)
 
+    icons["history_play"] = icon_from_svg("""
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <circle fill="#2e7d32" cx="12" cy="12" r="10"/>
+            <path fill="#ffffff" d="M9 7.5v9l7-4.5z"/>
+        </svg>
+    """)
+
     icons["delete"] = icon_from_svg("""
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
             <path fill="#d32f2f" d="M6.4 5l5.6 5.6L17.6 5 19 6.4 13.4 12 19 17.6 17.6 19 12 13.4 6.4 19 5 17.6 10.6 12 5 6.4z"/>
@@ -154,9 +161,22 @@ def _setup_icon_button(button: QPushButton, icon: QIcon, tooltip: str) -> None:
 
 
 class PlaybackController:
+    """
+    Потоковое воспроизведение через sounddevice.OutputStream.
+
+    sd.play() получает весь массив сразу и на длинных песнях/больших numpy-массивах
+    иногда даёт лаги UI и старт с ощущением замедления. Здесь audio отдаётся
+    аудио-драйверу маленькими блоками из callback, без копирования всего хвоста песни.
+    """
+
     def __init__(self) -> None:
         self.current_kind: str | None = None
-        self._token = 0
+        self._stream: sd.OutputStream | None = None
+        self._audio: np.ndarray | None = None
+        self._position = 0
+        self._sample_rate = 44100
+        self._finished_callback: Callable[[str], None] | None = None
+        self._finishing = False
 
     def play(
         self,
@@ -166,36 +186,86 @@ class PlaybackController:
         finished_callback: Callable[[str], None] | None = None,
     ) -> None:
         self.stop()
-        sd.play(audio, samplerate=sample_rate, blocking=False)
+        values = np.asarray(audio, dtype=np.float32)
+        if values.ndim == 1:
+            values = values.reshape(-1, 1)
         self.current_kind = kind
-        self._token += 1
-        token = self._token
-        duration_ms = max(1, int(len(audio) / sample_rate * 1000))
-        QTimer.singleShot(duration_ms, lambda: self._finish_if_current(kind, token, finished_callback))
+        self._audio = values
+        self._position = 0
+        self._sample_rate = int(sample_rate)
+        self._finished_callback = finished_callback
+        self._finishing = False
+        self._stream = sd.OutputStream(
+            samplerate=self._sample_rate,
+            channels=int(values.shape[1]),
+            dtype="float32",
+            blocksize=2048,
+            callback=self._audio_callback,
+            finished_callback=self._stream_finished,
+        )
+        self._stream.start()
 
     def stop(self, kind: str | None = None) -> None:
         if kind is not None and self.current_kind != kind:
             return
         if self.current_kind is None:
             return
-        sd.stop()
+
+        stream = self._stream
+        self._stream = None
         self.current_kind = None
-        self._token += 1
+        self._audio = None
+        self._position = 0
+        self._finished_callback = None
+        self._finishing = False
+
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
 
     def stop_all(self) -> None:
         self.stop()
 
-    def _finish_if_current(
-        self,
-        kind: str,
-        token: int,
-        finished_callback: Callable[[str], None] | None,
-    ) -> None:
-        if self.current_kind != kind or self._token != token:
+    def _audio_callback(self, outdata, frames, time_info, status) -> None:
+        audio = self._audio
+        if audio is None:
+            outdata.fill(0)
+            raise sd.CallbackStop
+
+        end = min(self._position + frames, len(audio))
+        chunk = audio[self._position:end]
+        written = len(chunk)
+
+        if written:
+            outdata[:written] = chunk
+
+        if written < frames:
+            outdata[written:] = 0
+            self._position = end
+            self._finishing = True
+            raise sd.CallbackStop
+
+        self._position = end
+
+    def _stream_finished(self) -> None:
+        kind = self.current_kind
+        callback = self._finished_callback
+
+        if kind is None or not self._finishing:
             return
+
+        self._stream = None
         self.current_kind = None
-        if finished_callback is not None:
-            finished_callback(kind)
+        self._audio = None
+        self._position = 0
+        self._finished_callback = None
+        self._finishing = False
+
+        if callback is not None:
+            QTimer.singleShot(0, lambda: callback(kind))
 
 
 class YouTubeImportWorker(QObject):
@@ -432,8 +502,12 @@ class TrainingHistoryDialog(QDialog):
         self,
         entries: list[TrainingHistoryEntry],
         chart_icon: QIcon,
+        play_icon: QIcon,
+        stop_icon: QIcon,
         delete_icon: QIcon,
         show_progress: Callable[[str, str], None],
+        play_recording: Callable[[TrainingHistoryEntry], bool],
+        stop_recording: Callable[[], None],
         delete_entry: Callable[[TrainingHistoryEntry], bool],
         clear_history: Callable[[], bool],
         parent=None,
@@ -441,10 +515,16 @@ class TrainingHistoryDialog(QDialog):
         super().__init__(parent)
         self.entries = entries
         self.chart_icon = chart_icon
+        self.play_icon = play_icon
+        self.stop_icon = stop_icon
         self.delete_icon = delete_icon
         self.show_progress = show_progress
+        self.play_recording = play_recording
+        self.stop_recording = stop_recording
         self.delete_entry = delete_entry
         self.clear_history = clear_history
+        self.play_buttons: dict[tuple[str, float], QPushButton] = {}
+        self.active_recording_key: tuple[str, float] | None = None
         self.setWindowTitle("История тренировки пения")
         self.setMinimumSize(820, 520)
 
@@ -501,6 +581,14 @@ class TrainingHistoryDialog(QDialog):
         label.setWordWrap(True)
         layout.addWidget(label, 1)
 
+        if entry.recording_path is not None and entry.recording_path.exists():
+            play_button = QPushButton("Прослушать попытку")
+            play_button.setIcon(self.play_icon)
+            play_button.setIconSize(ICON_SIZE)
+            play_button.clicked.connect(lambda: self._toggle_recording(entry))
+            self.play_buttons[self._entry_key(entry)] = play_button
+            layout.addWidget(play_button)
+
         progress_button = QPushButton("Отобразить прогресс успеха песни")
         progress_button.setIcon(self.chart_icon)
         progress_button.setIconSize(ICON_SIZE)
@@ -516,7 +604,36 @@ class TrainingHistoryDialog(QDialog):
         layout.addWidget(delete_button)
         return row
 
+    def _toggle_recording(self, entry: TrainingHistoryEntry) -> None:
+        started = self.play_recording(entry)
+        self._set_active_recording(self._entry_key(entry) if started else None)
+
+    def _set_active_recording(self, active_key: tuple[str, float] | None) -> None:
+        self.active_recording_key = active_key
+        for key, button in self.play_buttons.items():
+            if key == active_key:
+                button.setText("Стоп")
+                button.setIcon(self.stop_icon)
+                button.setToolTip("Остановить прослушивание попытки")
+            else:
+                button.setText("Прослушать попытку")
+                button.setIcon(self.play_icon)
+                button.setToolTip("Прослушать попытку")
+
+    def reset_play_buttons(self) -> None:
+        self._set_active_recording(None)
+
+    def closeEvent(self, event) -> None:
+        self.stop_recording()
+        event.accept()
+
+    def _entry_key(self, entry: TrainingHistoryEntry) -> tuple[str, float]:
+        return entry.song_key, entry.timestamp
+
     def _delete_one(self, entry: TrainingHistoryEntry) -> None:
+        if self._entry_key(entry) == self.active_recording_key:
+            self.stop_recording()
+            self.reset_play_buttons()
         if not self.delete_entry(entry):
             return
         self.entries = [
@@ -547,6 +664,8 @@ class MainWindow(QMainWindow):
         self.detector = AudioPitchDetector(self.voice_settings)
         self.beeper = Beeper()
         self.playback = PlaybackController()
+        self.current_history_recording_key: tuple[str, float] | None = None
+        self.training_history_dialog: TrainingHistoryDialog | None = None
 
         self.is_running = False
         self.is_playing_voice = False
@@ -570,6 +689,8 @@ class MainWindow(QMainWindow):
         self.last_score_update_time = 0.0
         self.last_latency_update_time = 0.0
         self.cached_latency_ms = 0
+        self.last_singing_pitch_time = 0.0
+        self.smoothed_volume_percent = 0.0
         self.current_cached_song_key: Optional[str] = None
         self.last_saved_training_voice_count = 0
         self.singing_attempt_started_from_beginning = False
@@ -1317,6 +1438,12 @@ class MainWindow(QMainWindow):
             return
         if kind == "song":
             self._finish_song_playback()
+            return
+        if kind == "history":
+            self.current_history_recording_key = None
+            if self.training_history_dialog is not None:
+                self.training_history_dialog.reset_play_buttons()
+            self.status_label.setText("Прослушивание попытки завершено")
 
     def _finish_song_playback(self) -> None:
         if not self.song_playing:
@@ -1869,11 +1996,11 @@ class MainWindow(QMainWindow):
 
         if frame is None:
             if self.song_loaded:
-                self.status_label.setText("Жду распознавания нот для оценки")
+                self._handle_missing_singing_pitch()
             else:
                 self.status_label.setText("Стабильный голос не найден")
-            self.status_label.setStyleSheet("font-size: 18px; color: gray;")
-            self.volume_bar.setValue(0)
+                self.status_label.setStyleSheet("font-size: 18px; color: gray;")
+                self.volume_bar.setValue(0)
             return
 
         timestamp = self._song_position() if self.song_loaded else time.monotonic()
@@ -1893,7 +2020,8 @@ class MainWindow(QMainWindow):
 
         error_hz = frame.frequency_hz - target_frequency
         clipped_error = max(-200, min(200, int(round(error_hz))))
-        volume_percent = max(0, min(100, int(frame.volume * 1200)))
+        raw_volume_percent = max(0, min(100, int(frame.volume * 1200)))
+        volume_percent = self._smooth_volume_percent(raw_volume_percent)
         voice_type = classify_voice_by_frequency(frame.frequency_hz)
 
         self.current_note_label.setText(frame.note_name)
@@ -1906,10 +2034,11 @@ class MainWindow(QMainWindow):
         self.volume_bar.setValue(volume_percent)
 
         if self.song_loaded:
+            self.last_singing_pitch_time = time.monotonic()
             self._update_singing_score()
             self.current_note_label.setText(frame.note_name)
             self.frequency_label.setText(f"Твой голос: {frame.frequency_hz:.2f} Гц")
-            self.volume_bar.setValue(max(0, min(100, int(frame.volume * 1200))))
+            self.volume_bar.setValue(volume_percent)
             return
 
         if not frame.stable_voice:
@@ -1928,6 +2057,37 @@ class MainWindow(QMainWindow):
 
         if self.beep_button.isChecked() and (frame.stable_voice or not self.voice_settings.beep_only_on_stable_voice):
             self.beeper.beep()
+
+    def _handle_missing_singing_pitch(self) -> None:
+        # Одиночные пропуски pitch detection нормальны для пения: согласные,
+        # вдохи, переходы, атаки нот. Не мигаем статусом и не обнуляем громкость
+        # каждый раз, иначе UI выглядит так, будто оценка постоянно ломается.
+        time_since_pitch = time.monotonic() - self.last_singing_pitch_time if self.last_singing_pitch_time else 999.0
+
+        if time_since_pitch < 1.25:
+            self.volume_bar.setValue(self._smooth_volume_percent(0))
+            return
+
+        self.volume_bar.setValue(self._smooth_volume_percent(0))
+
+        if self.last_score is not None:
+            total = self.last_score.total_score
+            if total.checked_frames >= 3:
+                self.status_label.setText("Продолжай петь — оценка обновится при следующей распознанной ноте")
+                self.status_label.setStyleSheet("font-size: 18px; color: #666666;")
+                return
+
+        self.status_label.setText("Пой в микрофон — точность появится после нескольких нот")
+        self.status_label.setStyleSheet("font-size: 18px; color: gray;")
+
+    def _smooth_volume_percent(self, value: int) -> int:
+        # Быстрая реакция на появление голоса и мягкое затухание вниз.
+        # Это только визуальный индикатор, на точность не влияет.
+        alpha = 0.45 if value > self.smoothed_volume_percent else 0.12
+        self.smoothed_volume_percent = self.smoothed_volume_percent * (1.0 - alpha) + value * alpha
+        if self.smoothed_volume_percent < 1.0:
+            self.smoothed_volume_percent = 0.0
+        return int(round(self.smoothed_volume_percent))
 
     def _update_singing_score(self) -> None:
         if self.melody_lookup is None:
@@ -2032,6 +2192,8 @@ class MainWindow(QMainWindow):
                 title=self.song_title or "Песня",
                 score_percent=total.score_percent,
                 rank=rank,
+                recording_audio=self.detector.get_session_recording(),
+                recording_sample_rate=self.detector.sample_rate,
             )
             self.last_saved_training_voice_count = voice_count
             self.singing_attempt_started_from_beginning = False
@@ -2044,13 +2206,56 @@ class MainWindow(QMainWindow):
         dialog = TrainingHistoryDialog(
             load_training_history(),
             self.icons["chart"],
+            self.icons["history_play"],
+            self.icons["stop"],
             self.icons["delete"],
             self._show_song_progress,
+            self._toggle_training_history_recording,
+            self._stop_training_history_recording,
             self._delete_training_history_entry,
             self._clear_training_history,
             self,
         )
-        dialog.exec()
+        self.training_history_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._stop_training_history_recording()
+            self.training_history_dialog = None
+
+    def _toggle_training_history_recording(self, entry: TrainingHistoryEntry) -> bool:
+        entry_key = (entry.song_key, entry.timestamp)
+
+        if self.current_history_recording_key == entry_key and self.playback.current_kind == "history":
+            self._stop_training_history_recording()
+            return False
+
+        if entry.recording_path is None or not entry.recording_path.exists():
+            QMessageBox.information(self, "Запись недоступна", "Звуковой файл этой попытки не найден.")
+            return False
+
+        try:
+            from core.training_storage import read_attempt_recording
+            audio, sample_rate = read_attempt_recording(entry.recording_path)
+            self._prepare_playback_start("history")
+            self.playback.play("history", audio, sample_rate, self._on_playback_finished)
+            self.current_history_recording_key = entry_key
+            self.status_label.setText(f"Воспроизвожу попытку: {entry.title}")
+            app_logger.info(f"Training history recording playback started: {entry.recording_path}")
+            return True
+        except Exception as exc:
+            self.current_history_recording_key = None
+            QMessageBox.critical(self, "Ошибка воспроизведения", str(exc))
+            app_logger.error(f"Failed to play training history recording: {exc}")
+            return False
+
+    def _stop_training_history_recording(self) -> None:
+        if self.playback.current_kind == "history":
+            self.playback.stop("history")
+            self.status_label.setText("Прослушивание попытки остановлено")
+        self.current_history_recording_key = None
+        if self.training_history_dialog is not None:
+            self.training_history_dialog.reset_play_buttons()
 
     def _delete_training_history_entry(self, entry: TrainingHistoryEntry) -> bool:
         answer = QMessageBox.question(

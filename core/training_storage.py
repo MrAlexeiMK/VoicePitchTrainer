@@ -39,6 +39,7 @@ class TrainingHistoryEntry:
     timestamp: float
     score_percent: float
     rank: str
+    recording_path: Optional[Path] = None
 
 
 def storage_root() -> Path:
@@ -54,6 +55,10 @@ def songs_dir() -> Path:
 
 def history_path() -> Path:
     return storage_root() / "training_history.json"
+
+
+def attempts_dir() -> Path:
+    return storage_root() / "training_attempts"
 
 
 def save_cached_song(
@@ -138,34 +143,56 @@ def load_cached_song(key: str) -> CachedSongData:
     )
 
 
-def save_training_history_entry(song_key: str, title: str, score_percent: float, rank: str) -> None:
+def save_training_history_entry(
+    song_key: str,
+    title: str,
+    score_percent: float,
+    rank: str,
+    recording_audio: Optional[np.ndarray] = None,
+    recording_sample_rate: Optional[int] = None,
+) -> None:
     storage_root().mkdir(parents=True, exist_ok=True)
     entries = [_entry_to_json(entry) for entry in load_training_history()]
+    timestamp = time.time()
+    recording_path = None
+
+    if recording_audio is not None and recording_sample_rate is not None and len(recording_audio) > 0:
+        recording_path = attempts_dir() / song_key / f"{int(timestamp * 1000)}.wav"
+        _write_wav_float(recording_path, recording_audio, int(recording_sample_rate))
+
     entries.append(
         {
             "song_key": song_key,
             "title": title,
-            "timestamp": time.time(),
+            "timestamp": timestamp,
             "score_percent": float(score_percent),
             "rank": rank,
+            "recording_path": str(recording_path) if recording_path is not None else "",
         }
     )
     _write_json(history_path(), entries[-500:])
 
 
 def delete_training_history_entry(song_key: str, timestamp: float) -> None:
-    entries = [
-        _entry_to_json(entry)
-        for entry in load_training_history()
-        if not (entry.song_key == song_key and abs(entry.timestamp - timestamp) < 0.001)
-    ]
-    _write_json(history_path(), entries)
+    remaining_entries = []
+    for entry in load_training_history():
+        if entry.song_key == song_key and abs(entry.timestamp - timestamp) < 0.001:
+            if entry.recording_path is not None:
+                try:
+                    entry.recording_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            continue
+        remaining_entries.append(_entry_to_json(entry))
+    _write_json(history_path(), remaining_entries)
 
 
 def clear_training_history() -> None:
     path = history_path()
     if path.exists():
         path.unlink()
+    if attempts_dir().exists():
+        shutil.rmtree(attempts_dir(), ignore_errors=True)
 
 
 def load_training_history() -> list[TrainingHistoryEntry]:
@@ -186,6 +213,7 @@ def load_training_history() -> list[TrainingHistoryEntry]:
                     timestamp=float(item.get("timestamp", 0.0)),
                     score_percent=float(item.get("score_percent", 0.0)),
                     rank=str(item.get("rank", "E")),
+                    recording_path=Path(str(item.get("recording_path", ""))) if item.get("recording_path") else None,
                 )
             )
         except Exception:
@@ -198,6 +226,10 @@ def history_for_song(song_key: str) -> list[TrainingHistoryEntry]:
         [entry for entry in load_training_history() if entry.song_key == song_key],
         key=lambda item: item.timestamp,
     )
+
+
+def read_attempt_recording(path: Path) -> tuple[np.ndarray, int]:
+    return _read_wav_float(path)
 
 
 def _touch_cached_song(key: str) -> None:
@@ -230,6 +262,7 @@ def _entry_to_json(entry: TrainingHistoryEntry) -> dict:
         "timestamp": entry.timestamp,
         "score_percent": entry.score_percent,
         "rank": entry.rank,
+        "recording_path": str(entry.recording_path) if entry.recording_path is not None else "",
     }
 
 

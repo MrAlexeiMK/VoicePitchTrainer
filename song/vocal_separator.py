@@ -1,3 +1,4 @@
+import sys
 import tempfile
 import wave
 from dataclasses import dataclass
@@ -42,7 +43,7 @@ def separate_vocals_with_demucs(
     В PyInstaller onefile Demucs иногда попадает в сборку без package data
     `demucs/remote/files.txt`. Этот файл нужен get_model() для списка моделей.
     Перед загрузкой модели восстанавливаем минимальный files.txt для популярных
-    моделей Demucs 4, чтобы exe работал без отдельного .spec.
+    моделей Demucs 4.
     """
 
     def progress(message: str) -> None:
@@ -154,46 +155,72 @@ def separate_vocals_with_demucs(
 
 def _ensure_demucs_remote_files_txt() -> None:
     """
-    PyInstaller не всегда автоматически добавляет non-python data-файлы Demucs.
+    Восстанавливает `demucs/remote/files.txt`, если PyInstaller не положил его
+    в onefile-сборку.
 
-    Demucs 4 читает `demucs/remote/files.txt` при get_model(). Если файла нет,
-    создаём минимальный вариант с официальными remote model ids, которые нужны
-    для моделей из настроек приложения.
+    Важно: в frozen exe `demucs.remote.__file__` иногда равен None. Поэтому тут
+    нельзя делать `Path(demucs.remote.__file__)` без проверки.
     """
     try:
+        import demucs
         import demucs.remote
     except Exception:
         return
 
-    remote_dir = Path(demucs.remote.__file__).resolve().parent
-    files_txt = remote_dir / "files.txt"
+    remote_dir = _detect_demucs_remote_dir(demucs, demucs.remote)
+    if remote_dir is None:
+        return
 
+    files_txt = remote_dir / "files.txt"
     if files_txt.exists():
         return
 
-    remote_dir.mkdir(parents=True, exist_ok=True)
-    files_txt.write_text(
-        "\n".join(
-            [
-                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th",
-                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/f7e0c4bc-ba3fe64a.th",
-                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/d12395a8-e57c48e6.th",
-                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/92cfc3b6-ef3bcb9c.th",
-                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/04573f0d-f3cf25b2.th",
-                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/75fc33f5-1941ce65.th",
-                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th",
-                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/31966d8d-3b6fcf95.th",
-                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5d2d6c55-db83574e.th",
-                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/7ecf8ec1-70f50cc9.th",
-                "https://dl.fbaipublicfiles.com/demucs/mdx_final/83fc094f-4a16d450.th",
-                "https://dl.fbaipublicfiles.com/demucs/mdx_final/464b36d7-e5a9386e.th",
-                "https://dl.fbaipublicfiles.com/demucs/mdx_final/14fc6a69-a89dd0ee.th",
-                "https://dl.fbaipublicfiles.com/demucs/mdx_final/7fd6ef75-a905dd85.th",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    try:
+        remote_dir.mkdir(parents=True, exist_ok=True)
+        files_txt.write_text(_demucs_remote_files_txt_content(), encoding="utf-8")
+    except Exception:
+        # Не падаем здесь своим кодом. Если Demucs всё ещё не сможет загрузить
+        # модель, пользователь получит уже реальную ошибку get_model().
+        return
+
+
+def _detect_demucs_remote_dir(demucs_module, remote_module) -> Optional[Path]:
+    remote_file = getattr(remote_module, "__file__", None)
+    if remote_file:
+        return Path(remote_file).resolve().parent
+
+    demucs_file = getattr(demucs_module, "__file__", None)
+    if demucs_file:
+        return Path(demucs_file).resolve().parent / "remote"
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass) / "demucs" / "remote"
+
+    return None
+
+
+def _demucs_remote_files_txt_content() -> str:
+    # Минимальный список remote weights для моделей, доступных в настройках:
+    # htdemucs, htdemucs_ft, mdx_extra, mdx_extra_q.
+    return "\n".join(
+        [
+            "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th",
+            "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/f7e0c4bc-ba3fe64a.th",
+            "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/d12395a8-e57c48e6.th",
+            "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/92cfc3b6-ef3bcb9c.th",
+            "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/04573f0d-f3cf25b2.th",
+            "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/75fc33f5-1941ce65.th",
+            "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th",
+            "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/31966d8d-3b6fcf95.th",
+            "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5d2d6c55-db83574e.th",
+            "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/7ecf8ec1-70f50cc9.th",
+            "https://dl.fbaipublicfiles.com/demucs/mdx_final/83fc094f-4a16d450.th",
+            "https://dl.fbaipublicfiles.com/demucs/mdx_final/464b36d7-e5a9386e.th",
+            "https://dl.fbaipublicfiles.com/demucs/mdx_final/14fc6a69-a89dd0ee.th",
+            "https://dl.fbaipublicfiles.com/demucs/mdx_final/7fd6ef75-a905dd85.th",
+        ]
+    ) + "\n"
 
 
 def _read_wav_float(path: Path) -> tuple[np.ndarray, int]:

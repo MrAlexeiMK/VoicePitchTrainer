@@ -1,5 +1,6 @@
 import shutil
 import time
+from datetime import datetime
 from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
@@ -37,6 +38,18 @@ from audio.pitch_detector import AudioPitchDetector
 from core.app_logger import app_logger
 from core.constants import TARGET_PRESETS
 from core.models import AudioDevice, SingingTrainingSettings, VoiceTrainingSettings
+from core.training_storage import (
+    CachedSongData,
+    TrainingHistoryEntry,
+    clear_training_history,
+    delete_training_history_entry,
+    history_for_song,
+    list_cached_songs,
+    load_cached_song,
+    load_training_history,
+    save_cached_song,
+    save_training_history_entry,
+)
 from core.music import classify_voice_by_frequency, note_to_frequency
 from song.audio_loader import load_audio_file
 from song.melody import analyze_song_melody
@@ -111,6 +124,20 @@ def _create_icons() -> dict[str, QIcon]:
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 24">
             <path fill="{color}" d="M3.5 9v6h4l5 4V5l-5 4h-4z"/>
             <path fill="{color}" d="M18.2 8.8l1.4-1.4 2.7 2.7 2.7-2.7 1.4 1.4-2.7 2.7 2.7 2.7-1.4 1.4-2.7-2.7-2.7 2.7-1.4-1.4 2.7-2.7z"/>
+        </svg>
+    """)
+
+
+    icons["chart"] = icon_from_svg(f"""
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path fill="{color}" d="M4 19h16v2H2V3h2z"/>
+            <path fill="{color}" d="M6 16l4-5 3 3 5-8 1.8 1.1-6.4 10.2-3.2-3.2-3.6 4.4z"/>
+        </svg>
+    """)
+
+    icons["delete"] = icon_from_svg("""
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path fill="#d32f2f" d="M6.4 5l5.6 5.6L17.6 5 19 6.4 13.4 12 19 17.6 17.6 19 12 13.4 6.4 19 5 17.6 10.6 12 5 6.4z"/>
         </svg>
     """)
 
@@ -315,6 +342,196 @@ class Beeper:
         QApplication.beep()
 
 
+
+
+def _rank_for_score(score_percent: float) -> tuple[str, str]:
+    if score_percent > 80.0:
+        return "S+", "#e6002d"
+    if score_percent > 70.0:
+        return "S", "#ff6d00"
+    if score_percent > 50.0:
+        return "A", "#7b1fa2"
+    if score_percent > 40.0:
+        return "B", "#1976d2"
+    if score_percent > 30.0:
+        return "C", "#00897b"
+    if score_percent > 20.0:
+        return "D", "#7cb342"
+    if score_percent > 10.0:
+        return "F", "#8bc34a"
+    return "E", "#777777"
+
+
+def _format_datetime(timestamp: float) -> str:
+    if timestamp <= 0:
+        return "—"
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+
+
+class SongProgressChart(QWidget):
+    def __init__(self, entries: list[TrainingHistoryEntry], parent=None) -> None:
+        super().__init__(parent)
+        self.entries = entries
+        self.setMinimumSize(640, 320)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        width, height = self.width(), self.height()
+        left, right, top, bottom = 54, 20, 24, 44
+        plot_width = max(1, width - left - right)
+        plot_height = max(1, height - top - bottom)
+        painter.fillRect(0, 0, width, height, self.palette().window())
+
+        painter.drawText(0, 0, width, 22, Qt.AlignmentFlag.AlignCenter, "Прогресс точности по попыткам")
+        painter.drawLine(left, top, left, top + plot_height)
+        painter.drawLine(left, top + plot_height, left + plot_width, top + plot_height)
+
+        for value in [0, 25, 50, 75, 100]:
+            y = top + plot_height - int(value / 100.0 * plot_height)
+            painter.drawText(6, y - 8, 42, 16, Qt.AlignmentFlag.AlignRight, f"{value}%")
+            painter.drawLine(left - 4, y, left + plot_width, y)
+
+        if not self.entries:
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Пока нет истории по этой песне")
+            return
+
+        if len(self.entries) == 1:
+            x_values = [left + plot_width // 2]
+        else:
+            x_values = [left + int(index / (len(self.entries) - 1) * plot_width) for index in range(len(self.entries))]
+
+        points: list[tuple[int, int]] = []
+        for x, entry in zip(x_values, self.entries):
+            score = max(0.0, min(100.0, entry.score_percent))
+            y = top + plot_height - int(score / 100.0 * plot_height)
+            points.append((x, y))
+
+        for first, second in zip(points, points[1:]):
+            painter.drawLine(first[0], first[1], second[0], second[1])
+
+        for point, entry in zip(points, self.entries):
+            rank, color = _rank_for_score(entry.score_percent)
+            painter.setBrush(Qt.GlobalColor.white)
+            painter.drawEllipse(point[0] - 4, point[1] - 4, 8, 8)
+            painter.drawText(point[0] - 26, point[1] - 24, 52, 18, Qt.AlignmentFlag.AlignCenter, rank)
+            painter.drawText(point[0] - 32, top + plot_height + 8, 64, 18, Qt.AlignmentFlag.AlignCenter, f"{entry.score_percent:.0f}%")
+
+
+class SongProgressDialog(QDialog):
+    def __init__(self, song_title: str, entries: list[TrainingHistoryEntry], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Прогресс: {song_title}")
+        self.setMinimumSize(700, 420)
+        layout = QVBoxLayout(self)
+        layout.addWidget(SongProgressChart(entries, self))
+
+
+class TrainingHistoryDialog(QDialog):
+    def __init__(
+        self,
+        entries: list[TrainingHistoryEntry],
+        chart_icon: QIcon,
+        delete_icon: QIcon,
+        show_progress: Callable[[str, str], None],
+        delete_entry: Callable[[TrainingHistoryEntry], bool],
+        clear_history: Callable[[], bool],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.entries = entries
+        self.chart_icon = chart_icon
+        self.delete_icon = delete_icon
+        self.show_progress = show_progress
+        self.delete_entry = delete_entry
+        self.clear_history = clear_history
+        self.setWindowTitle("История тренировки пения")
+        self.setMinimumSize(820, 520)
+
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setSpacing(8)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidget(self.content)
+
+        self.clear_button = QPushButton("Очистить весь прогресс")
+        self.clear_button.clicked.connect(self._clear_all)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.scroll)
+        layout.addWidget(self.clear_button)
+
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        while self.content_layout.count():
+            item = self.content_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.clear_button.setEnabled(bool(self.entries))
+
+        if not self.entries:
+            empty_label = QLabel("История пока пустая. Допой песню до конца, чтобы появился результат.")
+            empty_label.setWordWrap(True)
+            self.content_layout.addWidget(empty_label)
+            self.content_layout.addStretch()
+            return
+
+        for entry in self.entries:
+            self.content_layout.addWidget(self._create_row(entry))
+        self.content_layout.addStretch()
+
+    def _create_row(self, entry: TrainingHistoryEntry) -> QWidget:
+        row = QFrame()
+        row.setFrameShape(QFrame.Shape.StyledPanel)
+        layout = QHBoxLayout(row)
+
+        rank, color = _rank_for_score(entry.score_percent)
+        label = QLabel(
+            f"<b>{entry.title}</b><br>"
+            f"{_format_datetime(entry.timestamp)} · "
+            f"Точность {entry.score_percent:.0f}% · "
+            f"<span style='color:{color}; font-weight:700;'>({rank})</span>"
+        )
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setWordWrap(True)
+        layout.addWidget(label, 1)
+
+        progress_button = QPushButton("Отобразить прогресс успеха песни")
+        progress_button.setIcon(self.chart_icon)
+        progress_button.setIconSize(ICON_SIZE)
+        progress_button.clicked.connect(lambda: self.show_progress(entry.song_key, entry.title))
+        layout.addWidget(progress_button)
+
+        delete_button = QPushButton()
+        delete_button.setIcon(self.delete_icon)
+        delete_button.setIconSize(ICON_SIZE)
+        delete_button.setToolTip("Удалить эту запись из истории")
+        delete_button.setFixedWidth(42)
+        delete_button.clicked.connect(lambda: self._delete_one(entry))
+        layout.addWidget(delete_button)
+        return row
+
+    def _delete_one(self, entry: TrainingHistoryEntry) -> None:
+        if not self.delete_entry(entry):
+            return
+        self.entries = [
+            item for item in self.entries
+            if not (item.song_key == entry.song_key and item.timestamp == entry.timestamp)
+        ]
+        self._rebuild()
+
+    def _clear_all(self) -> None:
+        if not self.clear_history():
+            return
+        self.entries = []
+        self._rebuild()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -353,6 +570,9 @@ class MainWindow(QMainWindow):
         self.last_score_update_time = 0.0
         self.last_latency_update_time = 0.0
         self.cached_latency_ms = 0
+        self.current_cached_song_key: Optional[str] = None
+        self.last_saved_training_voice_count = 0
+        self.singing_attempt_started_from_beginning = False
 
         self.youtube_thread: Optional[QThread] = None
         self.youtube_worker: Optional[YouTubeImportWorker] = None
@@ -406,6 +626,11 @@ class MainWindow(QMainWindow):
         self.import_youtube_action = QAction("Найти и импортировать из YouTube (может потребоваться VPN)", self)
         self.import_youtube_action.triggered.connect(self._import_song_from_youtube)
         song_menu.addAction(self.import_youtube_action)
+
+        self.recent_songs_menu = song_menu.addMenu("Недавние песни")
+        self.training_history_action = QAction("История тренировки пения", self)
+        self.training_history_action.triggered.connect(self._show_training_history)
+        song_menu.addAction(self.training_history_action)
 
         song_menu.addSeparator()
 
@@ -623,11 +848,11 @@ class MainWindow(QMainWindow):
         stats_layout.setContentsMargins(10, 8, 10, 8)
         stats_layout.setSpacing(6)
         stats_layout.addWidget(self.score_big_label)
+        stats_layout.addWidget(self.score_all_label)
         accuracy_layout = QHBoxLayout()
         accuracy_layout.setSpacing(10)
         accuracy_layout.addWidget(self.score_3s_label)
         accuracy_layout.addWidget(self.score_10s_label)
-        accuracy_layout.addWidget(self.score_all_label)
         stats_layout.addLayout(accuracy_layout)
         stats_layout.addWidget(self.score_detail_label)
         card_layout.addWidget(self.singing_stats_panel)
@@ -865,28 +1090,48 @@ class MainWindow(QMainWindow):
         self.performance_button.setText("")
         self.performance_button.setToolTip(performance_text)
         self.performance_button.setIcon(self.icons["stop"] if self.is_playing_performance else self.icons["volume"])
+
+        # В основной панели отдельная кнопка песни больше не нужна:
+        # в режиме пения главная кнопка Старт управляет и микрофоном, и песней.
+        self.song_button.setVisible(False)
+        self.song_button.setEnabled(False)
+
         self.restart_song_button.setVisible(self.song_loaded)
         self.restart_song_button.setEnabled(self.song_loaded)
 
         if self.song_loaded:
+            start_text = "Стоп тренировки" if self.is_running else "Старт тренировки"
+            self.start_button.setToolTip(start_text)
+            self.start_button.setIcon(self.icons["stop"] if self.is_running else self.icons["play"])
+
             song_text = "Пауза песни" if self.song_playing else "Запустить песню"
             self.play_song_action.setText(song_text)
-            self.song_button.setText("")
-            self.song_button.setToolTip(song_text)
-            self.song_button.setIcon(self.icons["pause"] if self.song_playing else self.icons["play"])
-            self.song_button.setEnabled(True)
         else:
+            start_text = "Стоп" if self.is_running else "Старт"
+            self.start_button.setToolTip(start_text)
+            self.start_button.setIcon(self.icons["stop"] if self.is_running else self.icons["play"])
             self.play_song_action.setText("Запустить песню")
-            self.song_button.setText("")
-            self.song_button.setToolTip("Песня не загружена")
-            self.song_button.setIcon(self.icons["play"])
-            self.song_button.setEnabled(False)
 
         stems_export_available = self._demucs_export_available()
         self.export_vocals_action.setEnabled(stems_export_available)
         self.export_instrumental_action.setEnabled(stems_export_available)
 
+        self._refresh_recent_songs_menu()
         self._refresh_playback_mode_combo()
+
+    def _refresh_recent_songs_menu(self) -> None:
+        self.recent_songs_menu.clear()
+        songs = list_cached_songs()
+        if not songs:
+            action = QAction("Нет недавних песен", self)
+            action.setEnabled(False)
+            self.recent_songs_menu.addAction(action)
+            return
+        for song in songs:
+            action = QAction(song.title, self)
+            action.setToolTip(_format_datetime(song.updated_at))
+            action.triggered.connect(lambda checked=False, key=song.key: self._load_cached_song(key))
+            self.recent_songs_menu.addAction(action)
 
     def _refresh_playback_mode_combo(self) -> None:
         self.playback_mode_combo.setVisible(self.song_loaded)
@@ -928,23 +1173,30 @@ class MainWindow(QMainWindow):
 
     def _toggle_start(self) -> None:
         if self.is_running:
+            if self.song_loaded and self.song_playing:
+                self.song_pause_position = self._song_position()
+                self.playback.stop("song")
+                self.song_playing = False
+
             self.detector.stop()
             self.timer.stop()
             self.microphone_combo.setEnabled(True)
             self.refresh_microphones_button.setEnabled(True)
             self.show_all_devices_checkbox.setEnabled(True)
             self.is_running = False
-            self.start_button.setText("")
-            self.start_button.setToolTip("Старт")
-            self.start_button.setIcon(self.icons["play"])
-            self.status_label.setText("Остановлено")
+            self.status_label.setText("Тренировка остановлена" if self.song_loaded else "Остановлено")
             app_logger.info("Voice capture stopped")
+            self._refresh_menu_texts()
             return
 
         device = self._selected_audio_device()
         if device is None:
             QMessageBox.warning(self, "Ошибка микрофона", "Микрофон не выбран")
             app_logger.warning("Start requested without selected microphone")
+            return
+
+        if self.song_loaded and self._current_song_audio() is None:
+            QMessageBox.information(self, "Песня", "Сначала импортируй песню")
             return
 
         self.frequency_history.clear()
@@ -964,11 +1216,15 @@ class MainWindow(QMainWindow):
         self.refresh_microphones_button.setEnabled(False)
         self.show_all_devices_checkbox.setEnabled(False)
         self.is_running = True
-        self.start_button.setText("")
-        self.start_button.setToolTip("Стоп")
-        self.start_button.setIcon(self.icons["stop"])
-        self.status_label.setText("Слушаю...")
         self._save_app_settings()
+
+        if self.song_loaded:
+            self.status_label.setText("Тренировка началась. Пой поверх песни.")
+            self._play_song_from_position(self.song_pause_position)
+        else:
+            self.status_label.setText("Слушаю...")
+
+        self._refresh_menu_texts()
 
     def _toggle_beep(self) -> None:
         self.beep_button.setText("")
@@ -1065,9 +1321,10 @@ class MainWindow(QMainWindow):
     def _finish_song_playback(self) -> None:
         if not self.song_playing:
             return
+        self.status_label.setText("Песня закончилась")
+        self._record_completed_training_result_if_available()
         self.song_playing = False
         self.song_pause_position = 0.0
-        self.status_label.setText("Песня закончилась")
         self._refresh_menu_texts()
         app_logger.info("Song playback finished")
 
@@ -1193,19 +1450,86 @@ class MainWindow(QMainWindow):
         self.song_playing = False
         self.song_pause_position = 0.0
         self.song_playback_mode = "full"
+        self.current_cached_song_key = self._save_current_song_to_cache()
+        self.last_saved_training_voice_count = 0
 
         self.frequency_history.clear()
         self.detector.clear_session_recording()
         self.song_label.setText(f"Режим: тренинг пения / {self.song_title}")
 
         self.score_label.setText("")
-        self.status_label.setText("Песня импортирована. Нажми Старт и Запустить песню.")
+        self.status_label.setText("Песня импортирована. Нажми Старт тренировки.")
         self._refresh_menu_texts()
         self._update_singing_ui_visibility()
         app_logger.info(
             f"Song loaded: {title}, melody_points={len(self.song_melody)}, "
             f"demucs_stems_available={self.demucs_stems_available}"
         )
+
+    def _save_current_song_to_cache(self) -> Optional[str]:
+        if self.song_audio is None:
+            return None
+        try:
+            return save_cached_song(
+                title=self.song_title,
+                playback_audio=self.song_audio,
+                sample_rate=self.song_sample_rate,
+                melody=self.song_melody,
+                vocals_audio=self.song_vocals_audio,
+                instrumental_audio=self.song_instrumental_audio,
+                demucs_stems_available=self.demucs_stems_available,
+            )
+        except Exception as exc:
+            app_logger.error(f"Failed to cache song: {exc}")
+            return None
+
+    def _load_cached_song(self, key: str) -> None:
+        try:
+            data = load_cached_song(key)
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка загрузки песни", str(exc))
+            app_logger.error(f"Failed to load cached song: {exc}")
+            return
+        self._apply_cached_song(data)
+
+    def _apply_cached_song(self, data: CachedSongData) -> None:
+        if self.song_playing:
+            self.playback.stop("song")
+        self.song_audio = data.playback_audio
+        self.song_vocals_audio = data.vocals_audio
+        self.song_instrumental_audio = data.instrumental_audio
+        self.song_vocals_path = data.vocals_path
+        self.song_instrumental_path = data.instrumental_path
+        self.demucs_stems_available = data.info.demucs_stems_available
+        self.song_sample_rate = data.info.sample_rate
+        self.song_melody = data.melody
+        self.melody_lookup = MelodyLookup(self.song_melody)
+        self.song_title = data.info.title
+        self.current_cached_song_key = data.info.key
+        self.song_loaded = True
+        self.song_playing = False
+        self.song_pause_position = 0.0
+        self.song_started_at = 0.0
+        self.song_playback_mode = "full"
+        self.last_saved_training_voice_count = 0
+        self.singing_attempt_started_from_beginning = False
+        self.frequency_history.clear()
+        self.detector.clear_session_recording()
+        self.last_score = None
+        self.last_score_update_time = 0.0
+        self.last_latency_update_time = 0.0
+        self.cached_latency_ms = 0
+        self.song_label.setText(f"Режим: тренинг пения / {self.song_title}")
+        self.score_label.setText("")
+        self._set_total_accuracy_card("—", None)
+        self._set_accuracy_card(self.score_3s_label, "3 сек", "—")
+        self._set_accuracy_card(self.score_10s_label, "10 сек", "—")
+        self.score_detail_label.setText("Песня загружена из недавних. Нажми Старт тренировки.")
+        self.status_label.setText("Песня загружена из недавних")
+        self._refresh_menu_texts()
+        self._update_singing_ui_visibility()
+        self._refresh_chart()
+        app_logger.info(f"Cached song loaded: {self.song_title}")
 
     def _demucs_export_available(self) -> bool:
         return bool(
@@ -1305,14 +1629,10 @@ class MainWindow(QMainWindow):
             self.youtube_worker.cancel()
             self.status_label.setText("Отмена YouTube импорта запрошена")
             app_logger.warning("YouTube import cancellation requested")
-            # QProgressDialog.canceled() только помечает отмену. Если yt-dlp уже
-            # завершился или worker не успел вернуть failed(), UI не должен
-            # оставаться заблокированным.
             self.import_song_file_action.setEnabled(True)
             self.import_youtube_action.setEnabled(True)
             self._hide_progress()
             return
-
         if self.song_load_worker is not None:
             self.song_load_worker.cancel()
             self.status_label.setText("Отмена импорта запрошена")
@@ -1321,7 +1641,6 @@ class MainWindow(QMainWindow):
             self.import_youtube_action.setEnabled(True)
             self._hide_progress()
             return
-
         self.import_song_file_action.setEnabled(True)
         self.import_youtube_action.setEnabled(True)
         self._hide_progress()
@@ -1361,6 +1680,8 @@ class MainWindow(QMainWindow):
 
         duration = len(audio_source) / self.song_sample_rate
         self.song_pause_position = max(0.0, min(position, duration))
+        if len(self.frequency_history) == 0:
+            self.singing_attempt_started_from_beginning = self.song_pause_position <= 1.0
 
         start_sample = int(self.song_pause_position * self.song_sample_rate)
         audio = audio_source[start_sample:]
@@ -1399,12 +1720,13 @@ class MainWindow(QMainWindow):
         self.last_score_update_time = 0.0
         self.last_latency_update_time = 0.0
         self.cached_latency_ms = 0
+        self.singing_attempt_started_from_beginning = True
         self.current_note_label.setText("—")
         self.frequency_label.setText("Твой голос: —")
         self._set_accuracy_card(self.score_3s_label, "3 сек", "—")
         self._set_accuracy_card(self.score_10s_label, "10 сек", "—")
-        self._set_accuracy_card(self.score_all_label, "Всё время", "—")
-        self.score_detail_label.setText("Нажми «Запустить песню» и пой поверх мелодии")
+        self._set_total_accuracy_card("—", None)
+        self.score_detail_label.setText("Нажми «Старт тренировки» и пой поверх мелодии")
         self.status_label.setText("Тренировка сброшена")
         self.status_label.setStyleSheet("font-size: 18px; color: gray;")
         self._refresh_menu_texts()
@@ -1427,6 +1749,7 @@ class MainWindow(QMainWindow):
         self.last_score_update_time = 0.0
         self.last_latency_update_time = 0.0
         self.cached_latency_ms = 0
+        self.singing_attempt_started_from_beginning = position <= 1.0
         self.status_label.setText(f"Позиция песни: {position:.1f} сек.")
         app_logger.info(f"Song seek requested: {position:.2f}s")
 
@@ -1478,12 +1801,15 @@ class MainWindow(QMainWindow):
         self.song_melody = []
         self.melody_lookup = None
         self.song_pause_position = 0.0
+        self.current_cached_song_key = None
+        self.last_saved_training_voice_count = 0
+        self.singing_attempt_started_from_beginning = False
         self.song_label.setText("Режим: тренинг голоса")
         self.score_label.setText("")
         self.score_big_label.setText("Точность пения")
         self._set_accuracy_card(self.score_3s_label, "3 сек", "—")
         self._set_accuracy_card(self.score_10s_label, "10 сек", "—")
-        self._set_accuracy_card(self.score_all_label, "Всё время", "—")
+        self._set_total_accuracy_card("—", None)
         self.score_detail_label.setText("Начни петь — оценка появится автоматически")
         self.tendency_label.setText("Оценка появится, когда будет достаточно распознанных нот")
         self.advice_label.setText("")
@@ -1499,6 +1825,7 @@ class MainWindow(QMainWindow):
         self.allowed_error_caption.setVisible(pitch_mode)
         self.target_label.setVisible(pitch_mode)
         self.voice_type_label.setVisible(pitch_mode)
+        self.song_button.setVisible(False)
         self.singing_stats_panel.setVisible(self.song_loaded)
         self.score_label.setVisible(False)
         self.confidence_label.setVisible(pitch_mode)
@@ -1645,10 +1972,10 @@ class MainWindow(QMainWindow):
         )
         self.last_score = summary
 
-        self.score_big_label.setText("Точность пения")
+        rank = None if summary.total_score.checked_frames < 3 else _rank_for_score(summary.total_score.score_percent)
+        self._set_total_accuracy_card(self._format_score(summary.total_score), rank)
         self._set_accuracy_card(self.score_3s_label, "3 сек", self._format_score(summary.short_score))
         self._set_accuracy_card(self.score_10s_label, "10 сек", self._format_score(summary.medium_score))
-        self._set_accuracy_card(self.score_all_label, "Всё время", self._format_score(summary.total_score))
 
         if summary.short_score.checked_frames == 0 and summary.medium_score.checked_frames == 0 and summary.total_score.checked_frames == 0:
             self.score_detail_label.setText("Пой в микрофон — точность появится после нескольких нот")
@@ -1672,6 +1999,100 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("Неровно: работай над стабильностью и переходами")
             self.status_label.setStyleSheet("font-size: 18px; color: orange;")
+
+    def _set_total_accuracy_card(self, value: str, rank: Optional[tuple[str, str]]) -> None:
+        if rank is None:
+            rank_html = ""
+        else:
+            rank_label, rank_color = rank
+            rank_html = f" <span style='color:{rank_color}; font-weight:900;'>({rank_label})</span>"
+        self.score_all_label.setText(
+            "<div style='font-size: 14px; color: #555555;'>Всё время</div>"
+            f"<div style='font-size: 32px; font-weight: 800;'>{value}{rank_html}</div>"
+        )
+
+    def _record_completed_training_result_if_available(self) -> None:
+        if not self.singing_attempt_started_from_beginning:
+            return
+        if not self.song_loaded or self.current_cached_song_key is None or self.last_score is None:
+            return
+        duration = self._song_duration()
+        if duration is None or self._song_position() < duration - 0.75:
+            return
+        total = self.last_score.total_score
+        if total.checked_frames < 3:
+            return
+        voice_count = len(self.frequency_history)
+        if voice_count == self.last_saved_training_voice_count:
+            return
+        rank, _ = _rank_for_score(total.score_percent)
+        try:
+            save_training_history_entry(
+                song_key=self.current_cached_song_key,
+                title=self.song_title or "Песня",
+                score_percent=total.score_percent,
+                rank=rank,
+            )
+            self.last_saved_training_voice_count = voice_count
+            self.singing_attempt_started_from_beginning = False
+            self._refresh_recent_songs_menu()
+            app_logger.info(f"Training result saved: song={self.song_title}, score={total.score_percent:.1f}, rank={rank}")
+        except Exception as exc:
+            app_logger.error(f"Failed to save training result: {exc}")
+
+    def _show_training_history(self) -> None:
+        dialog = TrainingHistoryDialog(
+            load_training_history(),
+            self.icons["chart"],
+            self.icons["delete"],
+            self._show_song_progress,
+            self._delete_training_history_entry,
+            self._clear_training_history,
+            self,
+        )
+        dialog.exec()
+
+    def _delete_training_history_entry(self, entry: TrainingHistoryEntry) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Удалить запись",
+            f"Удалить результат по песне «{entry.title}» от {_format_datetime(entry.timestamp)}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        try:
+            delete_training_history_entry(entry.song_key, entry.timestamp)
+            app_logger.info(f"Training history entry deleted: song={entry.title}, timestamp={entry.timestamp}")
+            return True
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка удаления", str(exc))
+            app_logger.error(f"Failed to delete training history entry: {exc}")
+            return False
+
+    def _clear_training_history(self) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Очистить весь прогресс",
+            "Удалить всю историю тренировок пения? Это действие нельзя отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        try:
+            clear_training_history()
+            app_logger.warning("Training history cleared")
+            return True
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка очистки", str(exc))
+            app_logger.error(f"Failed to clear training history: {exc}")
+            return False
+
+    def _show_song_progress(self, song_key: str, title: str) -> None:
+        dialog = SongProgressDialog(title, history_for_song(song_key), self)
+        dialog.exec()
 
     def _format_score(self, score) -> str:
         if score.checked_frames < 3:

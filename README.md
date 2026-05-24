@@ -33,5 +33,5 @@ python main.py
 ## Build EXE
 
 ```bash
-pyinstaller --onefile --windowed --name VoicePitchTrainer main.py
+pyinstaller --clean --noconfirm VoicePitchTrainer.spec
 ```

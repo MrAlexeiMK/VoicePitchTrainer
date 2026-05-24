@@ -1,4 +1,3 @@
-import sys
 import tempfile
 import wave
 from dataclasses import dataclass
@@ -37,10 +36,10 @@ def separate_vocals_with_demucs(
     """
     Разделяет песню через Demucs без запуска `python -m demucs`.
 
-    В обычном Python-запуске Demucs читает свои package-data файлы сам.
-    В PyInstaller onefile эти файлы часто теряются, из-за чего get_model("htdemucs")
-    пишет "htdemucs is neither a single pre-trained model or a bag of models".
-    Поэтому перед get_model() восстанавливаем runtime mapping моделей Demucs.
+    Важно для EXE:
+    Demucs должен собираться через VoicePitchTrainer.spec, где PyInstaller
+    явно включает package-data Demucs. Без этого `get_model("htdemucs")`
+    в onefile-сборке не видит список моделей.
     """
 
     def progress(message: str) -> None:
@@ -54,9 +53,6 @@ def separate_vocals_with_demucs(
     def raise_if_cancelled() -> None:
         if cancel_callback is not None and cancel_callback():
             raise RuntimeError("Импорт песни отменён")
-
-    progress("Проверяю данные Demucs...")
-    _prepare_demucs_for_pyinstaller()
 
     progress(f"Загружаю Demucs модель '{model_name}'...")
     log(f"Demucs API mode enabled, model={model_name}")
@@ -148,86 +144,6 @@ def separate_vocals_with_demucs(
 
     progress("Demucs готов: вокал и инструментал разделены")
     return DemucsSeparatedStems(vocals_path=vocals_path, instrumental_path=instrumental_path)
-
-
-def _prepare_demucs_for_pyinstaller() -> None:
-    """
-    Делает Demucs устойчивым в PyInstaller onefile.
-
-    Проблема не в Torch и не в YouTube. В onefile-сборке PyInstaller часто не
-    кладёт non-python файлы Demucs:
-    - demucs/remote/files.txt
-    - demucs/remote/files.json
-    - demucs/remote/*.yaml
-
-    Тогда Demucs не знает, что такое "htdemucs". Вместо угадывания формата
-    files.txt патчим официальный словарь pretrained models, который использует
-    demucs.pretrained.get_model().
-    """
-    try:
-        import demucs.pretrained as pretrained
-    except Exception:
-        return
-
-    remote_root = getattr(pretrained, "REMOTE_ROOT", None)
-    if isinstance(remote_root, dict):
-        remote_root.setdefault("htdemucs", "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th")
-        remote_root.setdefault("htdemucs_ft", "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/f7e0c4bc-ba3fe64a.th")
-        remote_root.setdefault("mdx_extra", "https://dl.fbaipublicfiles.com/demucs/mdx_final/83fc094f-4a16d450.th")
-        remote_root.setdefault("mdx_extra_q", "https://dl.fbaipublicfiles.com/demucs/mdx_final/464b36d7-e5a9386e.th")
-
-    # Для версий Demucs, которые всё-таки читают remote/files.txt, создаём файл
-    # в формате "name url", а не просто список URL.
-    _ensure_demucs_remote_files_txt()
-
-
-def _ensure_demucs_remote_files_txt() -> None:
-    try:
-        import demucs
-        import demucs.remote
-    except Exception:
-        return
-
-    remote_dir = _detect_demucs_remote_dir(demucs, demucs.remote)
-    if remote_dir is None:
-        return
-
-    files_txt = remote_dir / "files.txt"
-    if files_txt.exists():
-        return
-
-    try:
-        remote_dir.mkdir(parents=True, exist_ok=True)
-        files_txt.write_text(_demucs_remote_files_txt_content(), encoding="utf-8")
-    except Exception:
-        return
-
-
-def _detect_demucs_remote_dir(demucs_module, remote_module) -> Optional[Path]:
-    remote_file = getattr(remote_module, "__file__", None)
-    if remote_file:
-        return Path(remote_file).resolve().parent
-
-    demucs_file = getattr(demucs_module, "__file__", None)
-    if demucs_file:
-        return Path(demucs_file).resolve().parent / "remote"
-
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        return Path(meipass) / "demucs" / "remote"
-
-    return None
-
-
-def _demucs_remote_files_txt_content() -> str:
-    return "\n".join(
-        [
-            "htdemucs https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th",
-            "htdemucs_ft https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/f7e0c4bc-ba3fe64a.th",
-            "mdx_extra https://dl.fbaipublicfiles.com/demucs/mdx_final/83fc094f-4a16d450.th",
-            "mdx_extra_q https://dl.fbaipublicfiles.com/demucs/mdx_final/464b36d7-e5a9386e.th",
-        ]
-    ) + "\n"
 
 
 def _read_wav_float(path: Path) -> tuple[np.ndarray, int]:
